@@ -1,0 +1,715 @@
+---
+title: "Relict dace workflow"
+author: "Melanie LaCava"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+library(knitr)
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Project background
+
+This project builds on a previous range-wide population genomics survey (Finger et al., 2022; doi:10.1111/csp2.12672)
+
+March-May 2022: I prepped 15 RAD libraries for sequencing (1374 total samples - 50 samples from Butte Valley, additional populations to add to Mandi's previous pop gen study; 1324 samples from Johnson Springs Wetland Complex, high density sampling in small area to investigate previously observed high genetic structure)
+
+May 2022: I submitted 15 libraries as single sample to UCD genome center to sequence on 3 lanes of Illumina HiSeq4000, 150bp paired end sequencing
+
+
+### Download raw sequencing data from UCD genome center to FARM
+
+Script download_data.sh
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --mail-user=mlacava@ucdavis.edu
+#SBATCH --mail-type=ALL
+#SBATCH --job-name=download
+#SBATCH --time=3-00:00:00
+#SBATCH --partition=med
+#SBATCH --output=download_data.out
+#SBATCH --error=download_data.err
+
+# Run this script with sbatch download_data.sh
+
+cd /home/mlacava/raw_data/RelictDace_BMAG070
+echo "starting at " date
+
+#download
+wget -r -nH -nc -np -R index.html*    http://slimsdata.genomecenter.ucdavis.edu/Data/qic3hmnk9t/Unaligned/Project_ASMB_BMAG070_Run1/
+date
+
+wget -r -nH -nc -np -R index.html*    http://slimsdata.genomecenter.ucdavis.edu/Data/zn6isc6xo3/Unaligned/Project_ASMB_BMAG070_Run2/
+date
+
+wget -r -nH -nc -np -R index.html*    http://slimsdata.genomecenter.ucdavis.edu/Data/spfehf5o6h/Unaligned/Project_ASMB_BMAG070_Run3/
+date
+```
+
+
+### Run FastQC
+
+#### Unzip fastq.gz files with script unzip_rawdata.sh
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --mail-user=mlacava@ucdavis.edu
+#SBATCH --mail-type=ALL
+#SBATCH --job-name=unzip
+#SBATCH --time=12:00:00
+#SBATCH --partition=med
+#SBATCH --output=unzip.out
+
+# Run this script with sbatch unzip_rawdata.sh
+
+cd /home/mlacava/raw_data/RelictDace_BMAG070
+
+gzip -drk /home/mlacava/raw_data/RelictDace_BMAG070
+```
+
+#### Run FastQC with script fastqc.sh
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --mail-user=mlacava@ucdavis.edu
+#SBATCH --mail-type=ALL
+#SBATCH --job-name=fastqc
+#SBATCH --time=12:00:00
+#SBATCH --partition=med
+#SBATCH --output=fastqc.out
+
+# Run this script with sbatch fastqc.sh
+
+#load module
+module load fastqc/0.11.9
+
+cd /home/mlacava/raw_data/RelictDace_BMAG070
+
+fastqc /home/mlacava/raw_data/RelictDace_BMAG070/*.fastq
+```
+
+
+### Demultiplex plates
+
+15 plates, each with a unique plate index, sequenced on all 3 lanes -> separate to plates first, then next step separate to individuals
+
+#### Create barcodes files ending in .tsv (tab-delimited, no header, two columns, one-word name for plates)
+
+```{r,echo=F}
+barcodes <- read.table("https://raw.githubusercontent.com/meflacava/RelictDace/main/metadata/barcodes_RD.tsv")
+names(barcodes) <- c("Plate","Barcode")
+kable(barcodes)
+```
+
+#### Demultiplex plates with script split_plates.sh - modify script below for each lane of sequencing by changing job name, output name, fastq file names, and output folder
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --mail-user=mlacava@ucdavis.edu
+#SBATCH --mail-type=ALL
+#SBATCH --job-name=splitp1
+#SBATCH --time=1-00:00:00
+#SBATCH --partition=med
+#SBATCH --output=splitp1.out
+
+# Run this script with sbatch split_plates.sh
+
+mkdir /scratch/$SLURM_JOBID
+cd /scratch/$SLURM_JOBID
+
+/home/maccamp/miniconda2/bin/fastq-multx -m 0 -B /home/mlacava/raw_data/RelictDace_BMAG070/barcodes_RD.tsv \
+/home/mlacava/raw_data/RelictDace_BMAG070/Undetermined_S0_L001_I1_001.fastq.gz \
+/home/mlacava/raw_data/RelictDace_BMAG070/Undetermined_S0_L001_R1_001.fastq.gz \
+/home/mlacava/raw_data/RelictDace_BMAG070/Undetermined_S0_L001_R2_001.fastq.gz \
+-o n/a \
+-o ./%_R1.fastq \
+-o ./%_R2.fastq
+
+mv ./*.fastq /home/mlacava/raw_data/RelictDace_BMAG070/demulti1/
+
+cd ..
+
+rm -r $SLURM_JOBID
+```
+
+#### Results:
+```{r,echo-F}
+seqs <- data.frame(lane=c(1,2,8),n.seq=c(497909152,508440663,517258556),Pct.demulti=c(0.94,0.94,0.92))
+kable(seqs)
+```
+
+So 6-8% of reads did not assign to a plate index
+
+
+### Demultiplex wells within each plate
+
+#### Make a list of tasks to apply perl script to samples in each lane/plate combo using MakeSplitTaskList.R
+
+```{r, eval=FALSE}
+file <- read.table("https://raw.githubusercontent.com/meflacava/RelictDace/main/metadata/IndBarcodes_RD.txt",header=T,stringsAsFactors=F)
+head(file)
+
+#Separate command list for each plate and each lane
+for (i in c(1,2,8)){ #lane
+  for (j in unique(file$Plate)){ #plate
+    x <- matrix(data=NA,nrow=length(unique(file$SampleID[file$Plate==j])),ncol=5)
+    
+    #fill consistent columns
+    x[,1] <- "/home/mlacava/scripts/BarcodeSplitListBestRadPairedEnd.pl"
+    x[,2] <- paste0("/home/mlacava/raw_data/RelictDace_BMAG070/demulti",i,"/plate",formatC(j,width=2,flag="0"),"_R1.fastq")
+    x[,3] <- paste0("/home/mlacava/raw_data/RelictDace_BMAG070/demulti",i,"/plate",formatC(j,width=2,flag="0"),"_R2.fastq")
+    count <- 1
+    
+    for (k in unique(file$SampleID[file$Plate==j])){ #individuals
+      x[count,4] <- paste0("GG",file$WellBarcode[file$SampleID==k]) #add GG to beginning of each barcode
+      x[count,5] <- paste0("/home/mlacava/raw_data/RelictDace_BMAG070/demulti",i,"/inds/",k)
+      count <- count + 1
+    }
+    write.table(x,paste0("lane",i,"_plate",formatC(j,width=2,flag="0"),".sh"),quote=F,row.names=F,col.names=F)
+  }
+}
+```
+
+#### BarcodeSplit_ML.pl to perform demultiplexing tasks from task list
+
+I got my copy from Mac's folder (he found it in Yingxin's folder, probably from Mike Miller) - I only added code to SLURM output to print info line and sequence of double barcodes, and annotated script
+
+```{perl, eval=FALSE}
+#!/usr/bin/perl
+
+if ($#ARGV == 3) { #read in arguments
+    $file1 = $ARGV[0];
+    $file2 = $ARGV[1];
+    $barcode = $ARGV[2];
+    $prefix = $ARGV[3];
+} else {
+    die;
+}
+
+@commas = split(/\,/, $barcode); #if barcode column has comma in it, takes everything up to comma, but if no comma in barcode column, then just takes whole barcode, so treat @commas like @barcode still
+$barcode_length = length($commas[0]); #length of barcode
+
+$x=0;
+while ($x <= $#commas) { #make empty fastq files
+    $hash_r1{$commas[$x]} = $prefix . "_RA_" . $commas[$x] . ".fastq";
+    $hash_r2{$commas[$x]} = $prefix . "_RB_" . $commas[$x] . ".fastq";
+    $filename_r1 = $hash_r1{$commas[$x]};
+    $filename_r2 = $hash_r2{$commas[$x]};
+    open($filename_r1, ">$filename_r1") or die;
+    open($filename_r2, ">$filename_r2") or die;
+    $x++;
+}
+
+
+open(FILE1, "<$file1") or die;
+open(FILE2, "<$file2") or die;
+
+
+while (<FILE1>) { #file 1 = multiplexed R1 reads, file 2 = multiplexed R2 reads
+
+    $f1a = $_; #the four lines of R1 reads
+    $f1b = <FILE1>;
+    $f1c = <FILE1>;
+    $f1d = <FILE1>;
+
+    $f2a = <FILE2>; #the four lines of R2 reads
+        $f2b = <FILE2>;
+        $f2c = <FILE2>;
+        $f2d = <FILE2>;
+    
+    $bc1 = substr($f1b,0,$barcode_length); #list of barcodes for all multiplexed reads in R1
+    $bc2 = substr($f2b,0,$barcode_length); #R2 read barcodes? but doesn't R2 not have barcodes?
+    
+    if ($hash_r1{$bc1} ne "" && $hash_r1{$bc2} eq "")  { #if target read in R2 matches barcode of individual with file currently open (eq = equal, ne = not equal)
+
+        $f1b_2 = substr($f1b, $barcode_length, length($f1b)); #grab read, but exclude barcode
+        $f1d_2 = substr($f1d, $barcode_length, length($f1d)); #grab quality scores, except for barcode section
+
+        $out1 = $hash_r1{$bc1};
+        $out2 = $hash_r2{$bc1};
+
+        print $out1 $f1a . $f1b_2 . $f1c . $f1d_2; #grab lines 1,3 of read as is, but grab shortened lines 2,4 with barcode removed from read, and put into individual's fastq file
+        print $out2 $f2a . $f2b . $f2c . $f2d; #grab same read and put it in individual's second fastq file
+
+    } elsif ($hash_r1{$bc1} eq "" && $hash_r1{$bc2} ne "")  { #if target read in R1 matches barcode of individual with file currently open (MAYBE only relevant to dual indexed reads? Maybe never does anything for my reads since I have a single barcode?)
+
+        $f2b_2 = substr($f2b, $barcode_length, length($f2b));
+        $f2d_2 = substr($f2d, $barcode_length, length($f2d));
+
+        $out1 = $hash_r1{$bc2};
+        $out2 = $hash_r2{$bc2};
+
+        print $out1 $f2a . $f2b_2 . $f2c . $f2d_2;
+        print $out2 $f1a . $f1b . $f1c . $f1d;
+
+    } elsif ($hash_r1{$bc1} ne "" && $hash_r1{$bc2} ne "")  { #if barcode is found at beginning of both R1 and R2 read - I don't understand why the code is ne and not eq, but when I added printing the reads, the barcode was on both reads, which makes sense to call that double barcodes
+
+        print "Double Barcode!\t$bc1\t$bc2\n";
+        print "$f1a\n"; #print info line from first double barcodes read
+        print "$f1b\n"; #print sequence from first double barcode read
+        print "$f2a\n"; #print info line from second double barcodes read
+        print "$f2b\n"; #print sequence from second double barcode read
+
+    }
+
+}
+close FILE1; close FILE2;
+
+
+
+$x=0;
+while ($x <= $#commas) {
+        close($hash_r1{$commas[$x]});
+    close($hash_r2{$commas[$x]});
+        $x++;
+}
+```
+
+#### Demultiplex with array job split_inds.sh
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --mail-user=mlacava@ucdavis.edu
+#SBATCH --mail-type=ALL
+#SBATCH --job-name=split
+#SBATCH --time=24:00:00
+#SBATCH --partition=med
+#SBATCH --array=1-45
+
+file=$(ls /home/mlacava/scripts/split_tasks | sed -n ${SLURM_ARRAY_TASK_ID}p)
+echo array task $SLURM_ARRAY_TASK_ID
+echo $file
+bash /home/mlacava/scripts/split_tasks/$file
+```
+
+#### Results:
+```{r,echo=F}
+reads <- read.csv("https://raw.githubusercontent.com/meflacava/RelictDace/main/results/ReadCountSummary.csv")
+kable(reads)
+```
+
+So ~20% of reads in each lane were unmatched
+
+
+### Combine fastq files for each individual across lanes
+
+I ran 1324 individuals each on 3 lanes of sequencing, so after demultiplexing to individual, I now have 1374 (samples) x 3 (lanes) x 2 (paired reads) = 8244 fastq files. For assembly, I want to concatenate fastq files for each individual so that I have 1374 (samples) x 2 (paired reads) = 2748 fastq files
+
+#### Paste list of 1374 sample IDs into a file called names
+
+#### Combine forward read fastqs for each sample across 3 lanes using scripts catRA.sh and catRB.sh
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --mail-user=mlacava@ucdavis.edu
+#SBATCH --mail-type=ALL
+#SBATCH --job-name=catA
+#SBATCH --time=24:00:00
+#SBATCH --partition=med
+
+#concatenate reads across sequencing lanes
+#this script is for combining forward reads across lanes 1, 2, and 8
+for i in `cat ~/raw_data/RelictDace_BMAG070/names`; do cat ~/raw_data/RelictDace_BMAG070/demulti1/inds/$i\_RA* ~/raw_data/RelictDace_BMAG070/demulti2/inds/$i\_RA* ~/raw_data/RelictDace_BMAG070/demulti8/inds/$i\_RA* > ~/raw_data/RelictDace_BMAG070/compiled/$i\_RA.fastq; done
+```
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --mail-user=mlacava@ucdavis.edu
+#SBATCH --mail-type=ALL
+#SBATCH --job-name=catB
+#SBATCH --time=24:00:00
+#SBATCH --partition=med
+
+#concatenate reads across sequencing lanes
+#this script is for combining reverse reads across lanes 1, 2, and 8
+for i in `cat ~/raw_data/RelictDace_BMAG070/names`; do cat ~/raw_data/RelictDace_BMAG070/demulti1/inds/$i\_RB* ~/raw_data/RelictDace_BMAG070/demulti2/inds/$i\_RB* ~/raw_data/RelictDace_BMAG070/demulti8/inds/$i\_RB* > ~/raw_data/RelictDace_BMAG070/compiled/$i\_RB.fastq; done
+```
+
+
+### Align paired reads to *Abramis brama* reference genome
+
+#### Identify and download suitable reference genome
+
+NCBI search for Leuciscidae genomes came up with 6 genomes assembled to level of 25 chromosomes, all from same subfamily Leuciscinae, all assemblies from Max Planck submitted in 2022 -> chose *Abramis brama* (common bream) because it had the fewest scaffolds (66) with a high scaffold N50 (42.5 Mb)
+
+GCA_022829085.1 (https://www.ncbi.nlm.nih.gov/data-hub/genome/GCA_022829085.1/)
+
+Upload reference genome to FARM into folder ~/align (move zipped folder from NCBI download to FARM, then unzip and move GCA_022829085.1_ASM2282908v1_genomic.fna FASTA file to ~/align for easy access, delete everything else in unzipped folder, but keep copy of zipped folder if needed)
+
+#### Index reference genome with BWA using bwa_index.sh
+
+```{bash, eval=FALSE}
+#!/bin/bash
+#SBATCH --mail-user=mlacava@ucdavis.edu
+#SBATCH --mail-type=ALL
+#SBATCH --job-name=index
+#SBATCH --time=1:00:00
+#SBATCH --partition=med
+cd /home/mlacava/align/
+module load bio3
+bwa index GCA_022829085.1_ASM2282908v1_genomic.fna
+```
+
+#### Align reads to reference genome
+
+Modified align.sh script from Shannon K
+
+```{bash, eval=FALSE}
+#!/bin/bash -l
+#SBATCH --mail-user=mlacava@ucdavis.edu
+#SBATCH --mail-type=ALL
+#SBATCH --job-name=align
+#SBATCH --error=/home/mlacava/slurm_logs/align.%j.err
+#SBATCH --output=/home/mlacava/slurm_logs/align.%j.out
+#SBATCH --cpus-per-task=4
+#SBATCH --partition=med
+#SBATCH --time=1:00:00
+
+##This script was written by Shannon Joslin, modified by Shannon Kieran and Melanie LaCava##
+
+##On command line, specify 1.Source fastqs directory (full path), 2.Alignment directory (full path of where reference genome is and where you want alignments to go), 3.Reference filename (no path)
+
+#Example: sbatch align.sh /home/mlacava/raw_data/RelictDace_BMAG070/compiled /home/mlacava/align GCA_022829085.1_ASM2282908v1_genomic.fna
+
+#BELOW: can edit amount of time to request for individual SBATCH scripts (set at 24 hours)
+
+set -e # exits upon failing command
+set -v # verbose -- all lines
+#set -x # trace of all commands after expansion before execution
+
+
+# set up directories ##
+data_dir=$1 ##where you keep your demultiplexed, renamed reads##
+align_dir=$2 ##where you want to keep your aligned reads directory##
+ref=$3 ##name of reference genome (that has already been BWA indexed)
+
+## NOTE: Need list of all sequence file names in a .list file.
+#     Need ID'd loci
+
+####################
+###  makeRADseqID .list  ###
+##this makes a list of all your RAs and RBs and puts it in your alignment directory##
+####################
+cd ${data_dir}
+
+ls *_RA.fastq > id1
+paste id1 id1 > id2
+sed -i 's/_RA.fastq//g' id2
+mv id2  ${align_dir}/RADseqID.list ##rename this file, and be sure to use sed or vim's %s/oldname/newname/g to change it in all the spots it pops up later##
+rm id1
+
+
+#######################
+###  align RAD seq  ###
+#######################
+
+cd $align_dir
+mkdir -p RAD_alignments
+##this parses the list of individuals and creates an alignment script for each one, and starts it running on medium.
+wc=$(wc -l RADseqID.list | awk '{print $1}')
+x=1
+while [[ $x -le $wc ]]
+do
+    string="sed -n ${x}p RADseqID.list"
+    str=$($string)
+
+        var=$(echo $str | awk -F"\t" '{print $1}')
+        set -- $var
+        c1=$1
+    c2=$2
+    echo "name is $1 path is $2"
+        echo "#!/bin/bash -l" >> aln_${c1}.sh #make a script to align each sample
+        echo "#SBATCH -o RAD_alignments/${c1}-%j.out" >> aln_${c1}.sh
+    echo "#SBATCH -p med" >> aln_${c1}.sh
+    echo "#SBATCH --time=24:00:00" >> aln_${c1}.sh
+    echo "module load bwa" >> aln_${c1}.sh
+    echo "module load samtools" >> aln_${c1}.sh
+    echo "making aln_${c1}.sh"
+        echo "" >> aln_${c1}.sh
+    echo "cd ${data_dir}" >> aln_${c1}.sh
+    echo "bwa mem ${align_dir}/${ref} ${data_dir}/${c2}_RA.fastq ${data_dir}/${c2}_RB.fastq > ${align_dir}/RAD_alignments/${c1}.sam"  >> aln_${c1}.sh #aligns the reads and outputs a sam file##
+    echo "samtools view -bS ${align_dir}/RAD_alignments/${c1}.sam > ${align_dir}/RAD_alignments/${c1}.bam" >> aln_${c1}.sh #outputs a compressed (bam)file
+        echo "samtools sort ${align_dir}/RAD_alignments/${c1}.bam -o ${align_dir}/RAD_alignments/${c1}_sorted.bam" >> aln_${c1}.sh #sorts the bamfile
+    echo "samtools view -b -f 0x2 ${align_dir}/RAD_alignments/${c1}_sorted.bam > ${align_dir}/RAD_alignments/${c1}_sorted_proper.bam" >> aln_${c1}.sh #filters reads that aren't properly paired (F/R)
+        echo "samtools rmdup ${align_dir}/RAD_alignments/${c1}_sorted_proper.bam ${align_dir}/RAD_alignments/${c1}_sorted_proper_rmdup.bam" >> aln_${c1}.sh #removes PCR duplicates#
+        echo "sleep 2m" >> aln_${c1}.sh #waits for this to finish
+        echo "samtools index ${align_dir}/RAD_alignments/${c1}_sorted_proper_rmdup.bam ${align_dir}/RAD_alignments/${c1}_sorted_proper_rmdup.bam.bai" >> aln_${c1}.sh #indexes bamfil
+        echo "reads=\$(samtools view -c ${align_dir}/RAD_alignments/${c1}_sorted.bam)" >> aln_${c1}.sh #calculates reads for the aligned file
+        echo "ppalign=\$(samtools view -c ${align_dir}/RAD_alignments/${c1}_sorted_proper.bam)" >> aln_${c1}.sh #calculates reads for the paired-filtered file
+        echo "rmdup=\$(samtools view -c ${align_dir}/RAD_alignments/${c1}_sorted_proper_rmdup.bam)" >> aln_${c1}.sh #calculates reads for the PCR-dup-filtered file.
+        echo "echo \"\${reads},\${ppalign},\${rmdup}\" > ${align_dir}/RAD_alignments/${c1}.stats" >> aln_${c1}.sh #outputs a stats file
+        sbatch -J ${c1}_radaln aln_${c1}.sh #starts the job running
+        #rm aln_${c1}.sh #removes the alignment script, because they are clutter
+
+        x=$(( $x + 1 ))
+
+done
+```
+
+
+
+### Incorporate previously generated RADseq data
+
+In addition to the new RADseq data I generated for this project, I am also using RADseq data generated by Alyssa Benjamin in 2017 (as well as some outgroup reference sequences she used). I used her demultiplexed FASTQ files found on FARM in /home/abenj93/projects/RelictDace/data/RD_fastq/ and aligned these to the reference genome, similar to my approach above, but with a slight modification to the script because of access restrictions in her FARM folder (align_R1R2.sh script below)
+
+```{bash,eval=F}
+#!/bin/bash -l
+#SBATCH --mail-user=mlacava@ucdavis.edu
+#SBATCH --mail-type=ALL
+#SBATCH --job-name=align
+#SBATCH --error=/home/mlacava/slurm_logs/align.%j.err
+#SBATCH --output=/home/mlacava/slurm_logs/align.%j.out
+#SBATCH --cpus-per-task=4
+#SBATCH --partition=med
+#SBATCH --time=1:00:00
+
+##This script was written by Shannon Joslin, modified by Shannon Kieran and Melanie LaCava##
+
+##On command line, specify 1.Source fastqs directory (full path), 2.Alignment directory (full path of where reference genome is and where you want alignments to go), 3.Reference filename (no path)
+
+#Example: sbatch align_R1R2.sh /home/abenj93/projects/RelictDace/data/RD_fastq /home/mlacava/align GCA_022829085.1_ASM2282908v1_genomic.fna
+
+#This version of this script looks for FASTQ files labeled as R1 and R2
+
+#BELOW: can edit amount of time to request for individual SBATCH scripts (set at 24 hours)
+
+set -e # exits upon failing command
+set -v # verbose -- all lines
+#set -x # trace of all commands after expansion before execution
+
+
+# set up directories ##
+data_dir=$1 ##where you keep your demultiplexed, renamed reads##
+align_dir=$2 ##where you want to keep your aligned reads directory##
+ref=$3 ##name of reference genome (that has already been BWA indexed)
+
+## NOTE: Need list of all sequence file names in a .list file.
+#     Need ID'd loci
+
+####################
+###  makeRADseqID .list  ###
+##this makes a list of all your RAs and RBs and puts it in your alignment directory##
+####################
+cd ${data_dir}
+
+ls *_R1.fastq > ${align_dir}/id1
+cd ${align_dir}
+paste id1 id1 > id2
+sed -i 's/_R1.fastq//g' id2
+mv id2  ${align_dir}/RADseqID.list ##rename this file, and be sure to use sed or vim's %s/oldname/newname/g to change it in all the spots it pops up later##
+rm id1
+
+
+#######################
+###  align RAD seq  ###
+#######################
+
+cd $align_dir
+mkdir -p RAD_alignments
+##this parses the list of individuals and creates an alignment script for each one, and starts it running on medium.
+wc=$(wc -l RADseqID.list | awk '{print $1}')
+x=1
+while [[ $x -le $wc ]]
+do
+    string="sed -n ${x}p RADseqID.list"
+    str=$($string)
+
+        var=$(echo $str | awk -F"\t" '{print $1}')
+        set -- $var
+        c1=$1
+    c2=$2
+    echo "name is $1 path is $2"
+        echo "#!/bin/bash -l" >> aln_${c1}.sh #make a script to align each sample
+        echo "#SBATCH -o RAD_alignments/${c1}-%j.out" >> aln_${c1}.sh
+    echo "#SBATCH -p med" >> aln_${c1}.sh
+    echo "#SBATCH --time=24:00:00" >> aln_${c1}.sh
+    echo "making aln_${c1}.sh"
+        echo "" >> aln_${c1}.sh
+    echo "cd ${data_dir}" >> aln_${c1}.sh
+    echo "bwa mem ${align_dir}/${ref} ${data_dir}/${c2}_R1.fastq ${data_dir}/${c2}_R2.fastq > ${align_dir}/RAD_alignments/${c1}.sam"  >> aln_${c1}.sh #aligns the reads and outputs a sam file##
+    echo "samtools view -bS ${align_dir}/RAD_alignments/${c1}.sam > ${align_dir}/RAD_alignments/${c1}.bam" >> aln_${c1}.sh #outputs a compressed (bam)file
+        echo "samtools sort ${align_dir}/RAD_alignments/${c1}.bam -o ${align_dir}/RAD_alignments/${c1}_sorted.bam" >> aln_${c1}.sh #sorts the bamfile
+    echo "samtools view -b -f 0x2 ${align_dir}/RAD_alignments/${c1}_sorted.bam > ${align_dir}/RAD_alignments/${c1}_sorted_proper.bam" >> aln_${c1}.sh #filters reads that aren't properly paired (F/R)
+        echo "samtools rmdup ${align_dir}/RAD_alignments/${c1}_sorted_proper.bam ${align_dir}/RAD_alignments/${c1}_sorted_proper_rmdup.bam" >> aln_${c1}.sh #removes PCR duplicates#
+        echo "sleep 2m" >> aln_${c1}.sh #waits for this to finish
+        echo "samtools index ${align_dir}/RAD_alignments/${c1}_sorted_proper_rmdup.bam ${align_dir}/RAD_alignments/${c1}_sorted_proper_rmdup.bam.bai" >> aln_${c1}.sh #indexes bamfil
+        echo "reads=\$(samtools view -c ${align_dir}/RAD_alignments/${c1}_sorted.bam)" >> aln_${c1}.sh #calculates reads for the aligned file
+        echo "ppalign=\$(samtools view -c ${align_dir}/RAD_alignments/${c1}_sorted_proper.bam)" >> aln_${c1}.sh #calculates reads for the paired-filtered file
+        echo "rmdup=\$(samtools view -c ${align_dir}/RAD_alignments/${c1}_sorted_proper_rmdup.bam)" >> aln_${c1}.sh #calculates reads for the PCR-dup-filtered file.
+        echo "echo \"\${reads},\${ppalign},\${rmdup}\" > ${align_dir}/RAD_alignments/${c1}.stats" >> aln_${c1}.sh #outputs a stats file
+        sbatch -J ${c1}_radaln aln_${c1}.sh #starts the job running
+        rm aln_${c1}.sh #removes the alignment script, because they are clutter
+
+        x=$(( $x + 1 ))
+
+done
+```
+
+
+
+#### Check alignment results
+
+alignstats.sh script from Shannon K
+
+```{bash, eval=FALSE}
+#!/bin/bash -l
+#SBATCH --mail-user=mlacava@ucdavis.edu
+#SBATCH --mail-type=ALL
+#SBATCH --job-name=stats
+#SBATCH --error=/home/mlacava/slurm_logs/align.%j.err
+#SBATCH --output=/home/mlacava/slurm_logs/align.%j.out
+#SBATCH --cpus-per-task=4
+#SBATCH --partition=med
+#SBATCH --time=01:00:00
+
+###This script was written by Shannon Joslin and modified by Shannon Kieran and Melanie LaCava##
+##command line arguments: 1. align directory name, 2. output stats file name
+#Example: sbatch alignstats.sh /home/mlacava/align/RAD_alignments alignstatsummary.csv
+
+set -e # exits upon failing command
+set -v # verbose -- all lines
+#set -x # trace of all commands after expansion before execution
+
+
+# set up directories
+RAD_dir=$1
+
+#############################
+###  create master stats  ###
+#############################
+
+##This just concatonates your stats and calculates some percentages. Use it to pick individuals with more than 50K reads to use in downstream analysis##
+cd ${RAD_dir}
+mkdir -p stats #makes a subdirectory called "stats"
+cp *.stats stats/.
+cd ${RAD_dir}/stats
+touch STATS.all
+touch STATNAMES.all
+for i in *.stats
+do
+echo "$(head -n 1 $i)" >> STATS.all
+echo "$i" >> STATNAMES.all
+done
+
+pr -mts, STATNAMES.all STATS.all > statsummary.all
+
+sed -i 's/\.stats//g' statsummary.all
+file="${RAD_dir}/stats/statsummary.all"
+touch $2
+n=$(wc -l ${file} | awk '{print $1}')
+x=1
+
+while [ $x -le $n ]
+do
+    string="sed -n ${x}p $file"
+        str=$($string)
+    nam=$(echo $str | awk -F"," '{print $1}')
+    aln=$(echo $str | awk -F"," '{print $2}')
+    ppd=$(echo $str | awk -F"," '{print $3}')
+    rmd=$(echo $str | awk -F"," '{print $4}')
+    p2=$(echo "scale=3 ; $ppd / $aln" | bc)
+    p3=$(echo "scale=3 ; $rmd / $ppd" | bc)
+    p4=$(echo "scale=3 ; $rmd / $aln" | bc)
+    echo "${nam},${aln},${ppd},${rmd},${p2},${p3},${p4}" >> $2
+    x=$(( $x + 1 ))
+done
+```
+
+Output file column headers
+
+1. Sample ID
+2. aln (number of aligned reads)
+3. ppd (number of aligned reads with properly paired reads)
+4. rmd (number of aligned reads with properly paired reads, with PCR duplicates removed)
+5. ppd/aln
+6. rmd/ppd
+7. rmd/aln
+
+Move to laptop to pair results with metadata and assess in R - look at the distribution of aligned reads across samples, how number of reads relates to library or sample site, how many samples failed
+
+```{r,eval=F}
+aln <- read.csv("https://raw.githubusercontent.com/meflacava/RelictDace/main/results/alignstatsummary.csv",header=F,na.strings="#N/A",stringsAsFactors=F)
+names(aln) <- c("SampleID","aligned","ppd","rmd","pct.ppd","pct.rmd","pct.rmd2")
+head(aln)
+
+hist(aln$rmd)
+range(aln$rmd)
+
+#Number of failed individuals (<50K reads)
+nrow(aln[aln$rmd<50000,])
+
+##Add metadata to look at which types of samples failed
+rd <- read.csv("https://raw.githubusercontent.com/meflacava/RelictDace/main/metadata/AllProjects_RD_Metadata.csv")
+for (i in 1:nrow(aln)){
+  aln$Library[i] <- rd$Library[rd$SampleID==aln$SampleID[i]]
+  aln$Site[i] <- rd$Site[rd$SampleID==aln$SampleID[i]]
+  #aln$Easting[i] <- rd$Easting[rd$SampleID==aln$SampleID[i]]
+  #aln$Northing[i] <- rd$Northing[rd$SampleID==aln$SampleID[i]]
+}
+head(aln)
+
+#Failed samples by library
+table(sort(aln$Library[aln$rmd<50000])) #lib 1-10=200ng, 11-14=50ng, 15=15ng
+
+#Failed samples by study area
+table(aln$Site[aln$rmd<50000])
+```
+
+
+
+
+### Filter out low-read individuals
+
+Subset bamlist to retain individuals with at least 50,000 aligned reads (or set stricter minimum of 100,000 reads)
+
+```{bash, eval=FALSE}
+#awk finds rows greater than 50k, then cut pulls the first column (names). Sed is just adding filepath info and full filename to the start and end of each entry. the -F"," and -d, are because this is a comma-separated list.
+awk -F"," '($4 > '50000')' alignstatsummary.csv | cut -d, -f 1 > rd.bamlist
+sed -i "s:^:/home/mlacava/align/RAD_alignments/:g" rd.bamlist
+sed -i 's/$/_sorted_proper_rmdup.bam/g' rd.bamlist
+```
+
+
+### Subset bamlist for different analyses
+
+For relict dace, I needed 3 bamlists:
+
+1. Range-wide phylogeny (496 total samples; all old samples sequenced in 2017, including speckled dace and tuichub outgroups; my new data from Cordano Ranch and Stratton Ranch)
+
+-   416 old samples sequenced by Alyssa (4 tui chub, 16 speckled dace (4 outgroup + 12 relict dace samples that were misidentified and are actually speckled dace), 396 relict dace)
+-   50 new samples I sequenced (20 Cordano Ranch, 30 Stratton Ranch)
+-   30 new JSWC samples I sequenced to ensure no diff between old and new samples/sequencing from the same sites
+
+2. Range-wide pop gen (476 total samples; all old samples sequenced in 2017 but excluding the tui chub and speckled dace outgroups)
+
+-   396 old samples sequenced by Alyssa
+-   50 new samples I sequenced (20 Cordano Ranch, 30 Stratton Ranch)
+-   30 new JSWC samples I sequenced to ensure no diff between old and new samples/sequencing from the same sites
+
+3. JSWC pop gen (1452 total samples; JSWC samples only)
+
+-   128 old samples sequenced by Alyssa
+-   1324 new samples I sequenced
+
+
+#### Number of samples after filtering out low-read individuals:
+
+Range-wide phylogenetics = 490
+
+Range-wide pop gen = 470
+
+JSWC = 1382
+
+
+#### Proceed with additional filtering and analyses using ANGSD or samtools
+
+Plot_PCAngsd.Rmd = call and filter SNPS to create a covariance matrix to plot PCAs
+
+Plot_NGSadmix.Rmd = admixture analysis on SNPs called using PCAngsd
+
+Plot_ThetaDiversity.Rmd = calculate diversity stats
+
+Plot_Fst.Rmd = using diversity stats to calculate pairwise Fst among populations
