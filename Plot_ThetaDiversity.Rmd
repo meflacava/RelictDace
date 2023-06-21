@@ -1,0 +1,200 @@
+---
+title: "Plot_ThetaDiversity"
+author: "Melanie LaCava"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+We're using ANGSD to calculate genetic diversity stats (thetas, Tajima's D, etc.), following this guide: http://www.popgen.dk/angsd/index.php/Tajima.
+
+## Make a bamlist for each site and a list of sites
+
+```{r,eval=F}
+
+## Subset your primary bamlist that includes all your samples to create one bamlist for each population or other grouping you want to calculate diversity stats for (e.g., each sampling site)
+
+#Import primary bamlist
+rdbam <- read.table("https://raw.githubusercontent.com/meflacava/RelictDace/main/bamlists/bam.rwpopgen.txt",header=F)
+names(rdbam) <- "SampleID"
+
+#Import grouping metadata
+rd <- read.csv("https://raw.githubusercontent.com/meflacava/RelictDace/main/metadata/AllProjects_RD_Metadata.csv")
+
+#Add grouping metadata to bamlist
+rdbam$SampleID <- sub("_sorted_proper_rmdup.bam.*","",rdbam$SampleID) #cut off long bam names to just get to sample IDs to make matching metadata easier
+rdbam$SampleID <- sub(".*/home/mlacava/align/RAD_alignments/","",rdbam$SampleID)
+for (i in 1:nrow(rdbam)){ #loop through bamlist and add columns for whatever grouping metadata you want
+  rdbam$Valley[i] <- rd$Valley[rd$SampleID==rdbam$SampleID[i]]
+  #rdbam$Site[i] <- rd$Site[rd$SampleID==rdbam$SampleID[i]]
+  rdbam$SiteWaypoint[i] <- rd$SiteWaypoint[rd$SampleID==rdbam$SampleID[i]]
+  #rdbam$LibPrepYear[i] <- rd$LibPrepYear[rd$SampleID==rdbam$SampleID[i]]
+}
+
+# #write list of sites to all.pop.list (find on GitHub)
+# write.table(sort(unique(rdbam$SiteWaypoint)),
+#             file="all.pop.list",
+#             quote=F,row.names=F,col.names=F)
+# 
+# #write bamlists for each site (find on GitHub)
+# for (i in unique(rdbam$SiteWaypoint)){
+#   x <- rdbam$V1[rdbam$SiteWaypoint==i]
+#   p <- "bamlists/"
+#   write.table(x,file=paste0(p,i,".bamlist"),quote=F,row.names=F,col.names=F)
+# }
+
+#Move your site bamlists and list of sites to FARM to run ANGSD
+
+```
+
+We have two options for calculating diversity stats:
+-   get_div_singlepop.sh will calc diversity for a single site that you name
+-   get_div_all.sh is an array script to submit one job for each site in a list
+
+## Calculate diversity for a single site
+
+```{bash, eval=FALSE}
+#!/bin/bash
+
+#SBATCH -t 0-02:00:00
+#SBATCH --job-name=div
+#SBATCH -p high
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=60GB
+#SBATCH --output=div-%A.out # File to which STDOUT will be written
+#SBATCH --error=div-%A.err # File to which STDERR will be written
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=mlacava@ucdavis.edu
+
+#MODIFY your reference genome path and name below, otherwise run as is
+
+#SUBMIT this job with: sbatch get_div_singlepop.sh [pop bamlist] [pop code]
+#Example: sbatch get_div_singlepop.sh BTOC.bamlist BTOC
+
+module load angsd
+
+bamlist=$1 #bamlist for pop of interest
+out=$2 #short code for pop to name output
+ref='/home/mlacava/align/GCA_022829085.1_ASM2282908v1_genomic.fna' #your reference genome
+
+
+## Step 1: find a global estimate of the SFS
+
+#Estimate the site allele frequency likelihood
+# P=number of threads
+# Use whatever quality scores you want (probably the same you used for PCAngsd)
+angsd -bam ${bamlist} -doSaf 1 -anc ${ref} -GL 1 -P 4 -minMapQ 20 -minQ 20 -out ${out}
+#output: .arg, .saf.gz, .saf.idx, .saf.pos.gz
+
+#Obtain ML estimate of the SFS
+# we are calculating a folded sfs because we do not know the ancestral state, and instead we are using the reference genome (if you know the ancestral state, provide it and exclude -fold 1 here and in next step)
+realSFS ${out}.saf.idx -maxIter 100 -P 4 -fold 1 > ${out}.sfs
+
+
+##Step 2: calculate thetas for each site
+
+realSFS saf2theta ${out}.saf.idx -sfs ${out}.sfs -outname ${out} -fold 1
+#output: out.thetas.gz and out.thetas.idx
+
+#extract logscale persite thetas
+thetaStat print ${out}.thetas.idx > ${out}.per-site.thetas.idx.txt
+
+
+##Step 3: estimate Tajima's D and other stats
+
+thetaStat do_stat ${out}.thetas.idx
+#output: .thetas.idx.pestPG
+
+```
+
+
+
+
+## Calculate diversity for a list of sites
+
+```{bash, eval=FALSE}
+#!/bin/bash
+
+#SBATCH -t 0-02:00:00
+#SBATCH --job-name=div
+#SBATCH -p high
+#SBATCH --cpus-per-task=4
+#SBATCH --mem=60GB
+#SBATCH --output=div-%A-%a.out # File to which STDOUT will be written
+#SBATCH --error=div-%A-%a.err # File to which STDERR will be written
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=mlacava@ucdavis.edu
+#SBATCH --array=1-30
+
+#Set SBATCH array range above based on number of pops in all.pop.list [e.g., 1-30 for 30 pops to test]
+# wc -l all.pop.list #check how many sites are in your pop list
+
+#Files to have in folder you run this job:
+# - bamlist for each pop you want div stats for (named [pop code].bamlist, e.g., BTOC.bamlist)
+# - all.pop.list = list of pop names, one per line (e.g., BTOC) that correspond to the bamlists in the same folder
+
+#MODIFY your reference genome path and name below, otherwise run as is
+
+#SUBMIT this job with: sbatch get_div_all.sh
+
+module load angsd
+
+pop=$(sed -n ${SLURM_ARRAY_TASK_ID}p all.pop.list)
+ref='/home/mlacava/align/GCA_022829085.1_ASM2282908v1_genomic.fna'
+
+
+## Step 1: find a global estimate of the SFS
+
+#Estimate the site allele frequency likelihood
+# P=number of threads
+# Use whatever quality scores you want (probably the same you used for PCAngsd)
+angsd -bam ${pop}.bamlist -doSaf 1 -anc ${ref} -GL 1 -P 4 -minMapQ 20 -minQ 20 -out ${pop}
+#output: .arg, .saf.gz, .saf.idx, .saf.pos.gz
+
+#Obtain ML estimate of the SFS
+# we are calculating a folded sfs because we do not know the ancestral state, and instead we are using the reference genome (if you know the ancestral state, provide it and exclude -fold 1 here and in next step)
+realSFS ${pop}.saf.idx -maxIter 100 -P 4 -fold 1 > ${pop}.sfs
+
+
+##Step 2: calculate thetas for each site
+
+realSFS saf2theta ${pop}.saf.idx -sfs ${pop}.sfs -outname ${pop} -fold 1
+#output: out.thetas.gz and out.thetas.idx
+
+#extract logscale persite thetas
+thetaStat print ${pop}.thetas.idx > ${pop}.per-site.thetas.idx.txt
+
+
+##Step 3: estimate Tajima's D and other stats
+
+thetaStat do_stat ${pop}.thetas.idx
+#output: .thetas.idx.pestPG
+
+```
+
+
+
+## Plot theta pi across sites
+
+```{r,eval=T}
+#List of sites - choose which pop list you want to include
+pops <- read.table("https://raw.githubusercontent.com/meflacava/RelictDace/main/bamlists/west.pop.list")
+pops <- pops$V1
+
+#For each site, import diversity stats and calculate standardized theta pi and watterson's theta
+theta <- data.frame(site=NA,tPstd=NA,tWstd=NA)
+for (i in pops){
+  x <- read.table(paste0("https://raw.githubusercontent.com/meflacava/RelictDace/main/results/diversity/",i,".thetas.idx.pestPG"))
+  names(x) <- c("index","chr","wincenter","tW","tP","tF","tH","tL","Tajima","fuf","fud","fayh","zeng","nSites") #got from ANGSD website
+  x$tPstd <- x$tP/x$nSites #standardize by number of sites
+  x$tWstd <- x$tW/x$nSites #standardize by number of sites
+  theta <- rbind(theta,data.frame(site=rep(i,length(x$tPstd)),tPstd=x$tPstd,tWstd=x$tWstd))
+}
+
+#boxplot
+boxplot(tPstd~site,data=theta,xlab="",ylab="Theta Pi",las=3,cex.axis=0.8)
+
+```

@@ -1,0 +1,490 @@
+---
+title: "Relict dace PCAngsd results"
+author: "Melanie LaCava"
+date: "`r Sys.Date()`"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(ggplot2)
+library(rgdal)
+
+```
+
+We have two sets of relict dace RADseq data, one set of samples prepped for sequencing by Alyssa Benjamin in 2017 and another set of samples prepped for sequencing by Melanie LaCava in 2021 - I aligned fastq files from both datasets to an Abramis brama reference genome and then used ANGSD to call genotypes and plot PCAs. I found a significant batch effect separating 2017 from 2021 samples - at a rangewide scale, the biological signal was stronger than the batch effect, but because we added two previously unsampled sites in 2021, we could not tell how much of their separation from other sites was due to biological signal vs. batch effect. I greatly reduced the batch effect with a few strategies, the last of which had the greatest impact:
+
+1. Trimmed sequencing reads to the same length (they were a few bp off)
+2. Set a strict filtering parameter that required retained SNPs to have data for at least 90% of individuals (so we would only retain sites genotyped across both batches)
+3. Used the 2017 samples to discover SNPs, then called genotypes for all samples at these restricted sites (the 2017 sites were the majority of samples (range-wide and when western and eastern valley sites were analyzed separately), and came from a diversity of sites, so low risk of ascertainment bias)
+
+## Call variants with ANGSD to produce covariance matrix
+
+```{r, eval=FALSE,echo=FALSE}
+####Prepare your bamlist to list all of the samples you want to include in your analysis####
+
+#Import sample metadata
+rd <- read.csv("https://raw.githubusercontent.com/meflacava/RelictDace/main/metadata/AllProjects_RD_Metadata.csv")
+
+#Import range-wide relict dace bamlist
+bam.rwpopgen <- read.table("https://raw.githubusercontent.com/meflacava/RelictDace/main/bamlists/bam.rwpopgen.txt")
+
+#add id without full path to link with rd metadata
+bam.rwpopgen$id <- sub("_sorted_proper_rmdup.bam.*","",bam.rwpopgen$V1)
+bam.rwpopgen$id <- sub(".*/home/mlacava/align/RAD_alignments/","",bam.rwpopgen$id)
+
+#subset into western and eastern valleys
+bam.west <- bam.rwpopgen[bam.rwpopgen$id %in% rd$SampleID[rd$Valley %in% c("Butte Valley","Ruby Valley")],1]
+bam.east <- bam.rwpopgen[bam.rwpopgen$id %in% rd$SampleID[rd$Valley %in% c("Goshute Valley","Spring Valley","Steptoe Valley")],1]
+length(bam.west)+length(bam.east)==nrow(bam.rwpopgen) #check to make sure all samples ended up on one of the two new bamlists
+
+#write files and then upload to FARM to use in ANGSD
+write.table(bam.west,"bam.west.txt",row.names=F,col.names=F,quote=F)
+write.table(bam.east,"bam.east.txt",row.names=F,col.names=F,quote=F)
+
+```
+
+#### Discover sites using 2017 rangewide samples
+
+Run ANGSD on FARM to produce list of sites using get_PCA_MDS1.sh
+
+```{bash,eval=F,echo=F}
+#Create chromosome list from reference genome - need for ANGSD
+awk '{print $1}' GCA_022829085.1_ASM2282908v1_genomic.fna.fai > chrom_list.txt
+```
+
+```{bash, eval=FALSE,echo=F}
+#!/bin/bash
+#SBATCH --time=1-00
+#SBATCH --mem=50G# Memory pool for all cores (see also --mem-per-cpu)
+#SBATCH --nodes=1
+#SBATCH --ntasks=8
+#SBATCH --partition=high # Partition to submit to
+#SBATCH --output=/home/mlacava/slurm_logs/pca-%A-%a.out # File to which STDOUT will be written
+#SBATCH --error=/home/mlacava/slurm_logs/pca-%A-%a.err # File to which STDERR will be written
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=mlacava@ucdavis.edu
+
+#Submit job with sbatch get_PCA_MDS1.sh [path/to/bamlist] [path/to/chromosome/list.txt] [path/to/desired/output]
+
+#For example:
+#sbatch get_PCA_MDS1.sh /home/mlacava/filtering/rwpopgen/bam.rwpopgen /home/mlacava/align/chrom_list.txt /home/mlacava/filtering/rwpopgen/pca/rwpopgen_PCA
+
+bamlist=$1 #provide name of bamlist with full path
+ref=$2 #provide full path to chromosome list for ref genome
+out=$3 #desired location and header for output files
+nInd=$(wc $bamlist | awk '{print $1}')
+minInd=$[$nInd*9/10] #set desired min percent of individuals with data for a site to be retained
+
+#mfreq=$4
+module load angsd
+
+angsd -bam ${bamlist} -out ${out} -doIBS 1 -rf ${ref} -doGLF 2 -doCounts 1 -doMajorMinor 1 -minMapQ 20 -minQ 20 -SNP_pval 1e-3 -minMaf 0.05 -makeMatrix 1 -doCov 1 -GL 1 -doMaf 1 -doPost 2 -minInd $minInd
+
+```
+
+```{bash,eval=F,echo=F}
+sbatch get_PCA_MDS1.sh /home/mlacava/filtering/rwpopgen/bam.2017rw /home/mlacava/align/chrom_list.txt /home/mlacava/filtering/rwpopgen/pca/rw_2017only
+sbatch get_PCA_MDS1.sh /home/mlacava/filtering/rwpopgen/bam.2017west /home/mlacava/align/chrom_list.txt /home/mlacava/filtering/rwpopgen/pca/west_2017only
+sbatch get_PCA_MDS1.sh /home/mlacava/filtering/rwpopgen/bam.2017east /home/mlacava/align/chrom_list.txt /home/mlacava/filtering/rwpopgen/pca/east_2017only
+```
+
+#### Extract list of sites resulting from 2017 ANGSD run
+
+```{bash,eval=F,echo=F}
+#Unzip mafs file and use to create list of sites [try to write code in linux - grab columns and add colon between, should be easy]
+gzip -drk rw_2017only.mafs.gz
+
+cut -f 1,2 rw_2017only.mafs > rw_loci2017 #grab first two columns in file
+sed -i 's/\t/:/g' rw_loci2017 #replace tab delimiter between columns with colon (-i tells sed to edit file in place)
+sed -i '1d' rw_loci2017 #delete header row
+
+gzip -drk west_2017only.mafs.gz
+cut -f 1,2 west_2017only.mafs > west_loci2017 #grab first two columns in file
+sed -i 's/\t/:/g' west_loci2017 #replace tab delimiter between columns with colon (-i tells sed to edit file in place)
+sed -i '1d' west_loci2017 #delete header row
+wc -l west_loci #75388
+
+gzip -drk east_2017only.mafs.gz
+cut -f 1,2 east_2017only.mafs > east_loci2017 #grab first two columns in file
+sed -i 's/\t/:/g' east_loci2017 #replace tab delimiter between columns with colon (-i tells sed to edit file in place)
+sed -i '1d' east_loci2017 #delete header row
+wc -l east_loci #110340
+```
+
+
+#### Call variants to produce covariance matrix using restricted loci list
+
+Run ANGSD on FARM to produce covariance matrix using get_PCA_SetLoci.sh
+
+```{bash,eval=F,echo=F}
+#!/bin/bash
+#SBATCH --time=2-00
+#SBATCH --mem=50G# Memory pool for all cores (see also --mem-per-cpu)
+#SBATCH --nodes=1
+#SBATCH --ntasks=8
+#SBATCH --partition=high # Partition to submit to
+#SBATCH --output=/home/mlacava/slurm_logs/pca-%A.out # File to which STDOUT will be written
+#SBATCH --error=/home/mlacava/slurm_logs/pca-%A.err # File to which STDERR will be written
+#SBATCH --mail-type=END,FAIL
+#SBATCH --mail-user=mlacava@ucdavis.edu
+
+#Submit job with sbatch get_PCA_MDS1.sh [path/to/bamlist] [path/to/reference.fna] [path/to/site.txt] [path/to/desired/output]
+
+bamlist=$1 #provide name of bamlist with full path
+ref=$2 #provide name of reference genome file with full path
+sites=$3 #provide list of sites to restrict analysis to (formatted as chromosome:position)
+out=$4 #desired output name
+nInd=$(wc $bamlist | awk '{print $1}')
+minInd=$[$nInd*9/10] #set desired min percent of individuals with data for a site to be retained
+
+#mfreq=$4
+module load angsd
+
+angsd -bam ${bamlist} -out ${out} -doIBS 1 -ref ${ref} -rf ${sites} -doGLF 2 -doCounts 1 -doMajorMinor 1 -minMapQ 20 -minQ 20 -SNP_pval 1e-3 -minMaf 0.05 -makeMatrix 1 -doCov 1 -GL 1 -doMaf 1 -doPost 2 -minInd $minInd
+```
+
+```{bash,eval=F,echo=F}
+sbatch get_PCA_SetLoci.sh /home/mlacava/filtering/rwpopgen/bam.rwpopgen /home/mlacava/align/GCA_022829085.1_ASM2282908v1_genomic.fna /home/mlacava/filtering/rwpopgen/rw_loci2017 /home/mlacava/filtering/rwpopgen/pca/rw_allsamples_2017snps
+
+sbatch get_PCA_SetLoci.sh /home/mlacava/filtering/rwpopgen/bam.west /home/mlacava/align/GCA_022829085.1_ASM2282908v1_genomic.fna /home/mlacava/filtering/rwpopgen/west_loci2017 /home/mlacava/filtering/rwpopgen/pca/west_allsamples_2017snps
+
+sbatch get_PCA_SetLoci.sh /home/mlacava/filtering/rwpopgen/bam.east /home/mlacava/align/GCA_022829085.1_ASM2282908v1_genomic.fna /home/mlacava/filtering/rwpopgen/east_loci2017 /home/mlacava/filtering/rwpopgen/pca/east_allsamples_2017snps
+```
+
+Number of sites retained after filtering:
+
+-   97470 (range-wide, 470 samples)
+
+-   68084 (western valleys, 132 samples)
+
+-   104106 (eastern valleys, 338 samples)
+
+## Sampling sites
+
+```{r, echo=FALSE, results="hide", warning=FALSE}
+
+##Import valleys and sites shapefiles (download from GitHub to local maps folder)
+valleys <- readOGR(dsn="maps",layer="RD_valleys")
+sites <- readOGR(dsn="maps",layer="RD_sites")
+
+##Plot background color of valleys and site labels
+par(mar=c(1,1,1,1)) #default: par(mar=c(5.1,4.1,4.1,2.1))
+plot(valleys,col=valleys$color,border=F)
+plot(sites,add=T,pch=16,cex=0.7)
+text(sites,labels=sites$Site,cex=0.6,pos=4,offset=0.3)
+legend("bottomleft",legend=unique(valleys$valley),pch=22,col="black",pt.bg=unique(valleys$color),pt.cex=2)
+par(mar=c(5.1,4.1,4.1,2.1)) #reset par
+
+```
+
+## Range-wide PCA
+
+### Screeplot of percent variance explained by first 10 PCs
+
+```{r, echo=FALSE}
+
+## Import and prep data for plotting
+
+#Import covariance matrix
+rd_mat <- as.matrix(read.table("https://raw.githubusercontent.com/meflacava/RelictDace/main/results/rwpopgen_PCA.covMat"))
+
+#Import bamlist
+rd_meta <- read.table("https://raw.githubusercontent.com/meflacava/RelictDace/main/bamlists/bam.rwpopgen.txt",header=F)
+
+#Import metadata to add to bamlist
+rd <- read.csv("https://raw.githubusercontent.com/meflacava/RelictDace/main/metadata/AllProjects_RD_Metadata.csv")
+
+#add metadata to rd_meta
+names(rd_meta) <- "SampleID"
+rd_meta$SampleID <- sub("_sorted_proper_rmdup.bam.*","",rd_meta$SampleID)
+rd_meta$SampleID <- sub(".*/home/mlacava/align/RAD_alignments/","",rd_meta$SampleID)
+#sum(rd_meta$SampleID %in% rd$SampleID) == nrow(rd_meta) #check all bam IDs are in metadata
+for (i in 1:nrow(rd_meta)){
+  rd_meta$Valley[i] <- rd$Valley[rd$SampleID==rd_meta$SampleID[i]]
+  rd_meta$Site[i] <- rd$Site[rd$SampleID==rd_meta$SampleID[i]]
+  rd_meta$SiteWaypoint[i] <- rd$SiteWaypoint[rd$SampleID==rd_meta$SampleID[i]]
+  rd_meta$LibPrepYear[i] <- rd$LibPrepYear[rd$SampleID==rd_meta$SampleID[i]]
+}
+#head(rd_meta)
+#order valleys and sites to group western valleys together
+#rd_meta$Valley <- factor(rd_meta$Valley,levels=c("Ruby Valley","Butte Valley","Goshute Valley","Spring Valley","Steptoe Valley"))
+#rd_meta$Site <- factor(rd_meta$Site,levels=c("RBFR","RBFL","RBRL","BTQP","BTOC","BTNS","BTST","GSTS","GSJS","STCO","STPR","STMR","STRT","STWA","SPSH","SPKR"))
+
+#prep matrix for plotting
+eig <- eigen(rd_mat, symm=T)
+eig$val <- eig$val/sum(eig$val)
+PC <- as.data.frame(eig$vectors)
+colnames(PC) <- gsub("V", "PC", colnames(PC))
+
+#adding metadata parameters
+PC$Valley <- factor(rd_meta$Valley)
+PC$Site <- factor(rd_meta$Site)
+PC$SiteWaypoint <- factor(rd_meta$SiteWaypoint)
+PC$LibPrepYear <- factor(rd_meta$LibPrepYear)
+
+#screeplot of % var explained by first 10 PC axes
+barplot(eig$val[1:10],ylab="% variance explained",names.arg=names(PC[1:10]))
+
+```
+
+```{r,eval=F,echo=FALSE}
+# ### Range-wide PCA (colored by valley) - PC1 x PC2
+# 
+# #Goshute (red), Steptoe (yellow), Butte (purple), Ruby (blue), Spring (green)
+# myColors <- c("#F49D94","#B9BE44","#EA91FB","#70C1FC","#6DCF9C")
+# names(myColors) <- unique(PC$Valley)
+# 
+# ggplot2::ggplot(PC, ggplot2::aes(x = PC1,y = PC2, color = Valley)) + 
+#   ggplot2::geom_point(cex = 4, alpha = 0.75) + 
+#   ggplot2::theme_classic() + 
+#   ggplot2::xlab(paste0("PC1, ", round(eig$val[1] * 100, 2), "% variance explained")) + 
+#   ggplot2::ylab(paste0("PC2, ", round(eig$val[2] * 100, 2), "% variance explained")) + 
+#   ggplot2::guides(color = ggplot2::guide_legend(title = "Valley")) +
+#   ggplot2::scale_color_manual(name="Valley",values=myColors)
+```
+
+### Range-wide PCA - PC1 x PC2
+
+PC1 clearly separates western valleys (Butte and Ruby) from eastern valleys. PC2 separates Twin Springs (GSTS) from other eastern sites. Due to the clear separation between west and east (a pattern consistent with Finger et al. 2022 and previous Houston et al. studies), we proceeded with separate analyses for the western valley sites and eastern valley sites.
+
+```{r,echo=FALSE}
+ggplot2::ggplot(PC, ggplot2::aes(x = PC1,y = PC2, color = Site)) + 
+  ggplot2::geom_point(cex = 4, alpha = 0.75) + 
+  ggplot2::theme_classic() + 
+  ggplot2::xlab(paste0("PC1, ", round(eig$val[1] * 100, 2), "% variance explained")) + 
+  ggplot2::ylab(paste0("PC2, ", round(eig$val[2] * 100, 2), "% variance explained")) + 
+  ggplot2::guides(color = ggplot2::guide_legend(title = "Site"))
+
+```
+
+
+## Western valleys PCAs
+
+### Screeplot of percent variance explained by first 10 PCs
+
+```{r, echo=FALSE}
+
+## Import and prep data for plotting
+
+#Import covariance matrix
+rd_mat <- as.matrix(read.table("https://raw.githubusercontent.com/meflacava/RelictDace/main/results/west_PCA.covMat"))
+
+#Import bamlist
+rd_meta <- read.table("https://raw.githubusercontent.com/meflacava/RelictDace/main/bamlists/bam.west.txt",header=F)
+
+#Import metadata to add to bamlist
+rd <- read.csv("https://raw.githubusercontent.com/meflacava/RelictDace/main/metadata/AllProjects_RD_Metadata.csv")
+
+#add metadata to rd_meta
+names(rd_meta) <- "SampleID"
+rd_meta$SampleID <- sub("_sorted_proper_rmdup.bam.*","",rd_meta$SampleID)
+rd_meta$SampleID <- sub(".*/home/mlacava/align/RAD_alignments/","",rd_meta$SampleID)
+#sum(rd_meta$SampleID %in% rd$SampleID) == nrow(rd_meta) #check all bam IDs are in metadata
+for (i in 1:nrow(rd_meta)){
+  rd_meta$Valley[i] <- rd$Valley[rd$SampleID==rd_meta$SampleID[i]]
+  rd_meta$Site[i] <- rd$Site[rd$SampleID==rd_meta$SampleID[i]]
+  rd_meta$SiteWaypoint[i] <- rd$SiteWaypoint[rd$SampleID==rd_meta$SampleID[i]]
+  rd_meta$LibPrepYear[i] <- rd$LibPrepYear[rd$SampleID==rd_meta$SampleID[i]]
+}
+#head(rd_meta)
+#order valleys and sites to group western valleys together
+#rd_meta$Valley <- factor(rd_meta$Valley,levels=c("Ruby Valley","Butte Valley","Goshute Valley","Spring Valley","Steptoe Valley"))
+#rd_meta$Site <- factor(rd_meta$Site,levels=c("RBFR","RBFL","RBRL","BTQP","BTOC","BTNS","BTST","GSTS","GSJS","STCO","STPR","STMR","STRT","STWA","SPSH","SPKR"))
+
+#prep matrix for plotting
+eig <- eigen(rd_mat, symm=T)
+eig$val <- eig$val/sum(eig$val)
+PC <- as.data.frame(eig$vectors)
+colnames(PC) <- gsub("V", "PC", colnames(PC))
+
+#adding metadata parameters
+PC$Valley <- factor(rd_meta$Valley)
+PC$Site <- factor(rd_meta$Site)
+PC$SiteWaypoint <- factor(rd_meta$SiteWaypoint)
+PC$LibPrepYear <- factor(rd_meta$LibPrepYear)
+
+#screeplot of % var explained by first 10 PC axes
+barplot(eig$val[1:10],ylab="% variance explained",names.arg=names(PC[1:10]))
+
+```
+
+```{r,echo=FALSE, eval=FALSE}
+# #Western valleys PCA (colored by valley) - PC1 x PC2 (by site is more helpful, so excluding)
+# 
+# #Butte (purple), Ruby (blue)
+# myColors <- c("#EA91FB","#70C1FC")
+# names(myColors) <- unique(PC$Valley)
+# #need: 
+# ggplot2::ggplot(PC, ggplot2::aes(x = PC1,y = PC2, color = Valley)) + 
+#   ggplot2::geom_point(cex = 4, alpha = 0.75) + 
+#   ggplot2::theme_classic() + 
+#   ggplot2::xlab(paste0("PC1, ", round(eig$val[1] * 100, 2), "% variance explained")) + 
+#   ggplot2::ylab(paste0("PC2, ", round(eig$val[2] * 100, 2), "% variance explained")) + 
+#   ggplot2::guides(color = ggplot2::guide_legend(title = "Valley")) +
+#   ggplot2::scale_color_manual(name="Valley",values=myColors)
+
+```
+
+### Western PCA - PC1 x PC2
+
+When analyzing only the western valley sites, PC1 clearly separates the newly sampled sites at Stratton Ranch (BTST, BTST_NSR) from the rest of the sites. PC2 separates the other two Butte Valley sites (BTOC, BTQP) from Ruby Valley sites. On PC2, Franklin sites (RBFL, RBFR) cluster together, whereas the two Ruby Lake sites (RBRL_P226, RBRL_P246) cluster away from Franklin sites and away from each other.
+
+```{r,echo=FALSE}
+ggplot2::ggplot(PC, ggplot2::aes(x = PC1,y = PC2, color = SiteWaypoint)) + 
+  ggplot2::geom_point(cex = 4, alpha = 0.75) + 
+  ggplot2::theme_classic() + 
+  ggplot2::xlab(paste0("PC1, ", round(eig$val[1] * 100, 2), "% variance explained")) + 
+  ggplot2::ylab(paste0("PC2, ", round(eig$val[2] * 100, 2), "% variance explained")) + 
+  ggplot2::guides(color = ggplot2::guide_legend(title = "Site"))
+
+```
+
+### Western PCA - PC2 x PC3
+
+PC3 further separates the two ponds within Ruby Lake (RBRL_P226, RBRL_P246) from the other sites and from each other.
+
+```{r,echo=FALSE}
+ggplot2::ggplot(PC, ggplot2::aes(x = PC2,y = PC3, color = SiteWaypoint)) + 
+  ggplot2::geom_point(cex = 4, alpha = 0.75) + 
+  ggplot2::theme_classic() + 
+  ggplot2::xlab(paste0("PC2, ", round(eig$val[2] * 100, 2), "% variance explained")) + 
+  ggplot2::ylab(paste0("PC3, ", round(eig$val[3] * 100, 2), "% variance explained")) + 
+  ggplot2::guides(color = ggplot2::guide_legend(title = "Site"))
+
+```
+
+### Western PCA - PC2 x PC5
+
+It is not until PC5 that we see Odgers Creek (BTOC) and Quilici Pond (BTQP) separate from each other.
+
+```{r,echo=FALSE}
+ggplot2::ggplot(PC, ggplot2::aes(x = PC2,y = PC5, color = SiteWaypoint)) + 
+  ggplot2::geom_point(cex = 4, alpha = 0.75) + 
+  ggplot2::theme_classic() + 
+  ggplot2::xlab(paste0("PC2, ", round(eig$val[2] * 100, 2), "% variance explained")) + 
+  ggplot2::ylab(paste0("PC5, ", round(eig$val[5] * 100, 2), "% variance explained")) + 
+  ggplot2::guides(color = ggplot2::guide_legend(title = "Site"))
+
+```
+
+
+## Eastern valleys PCAs
+
+### Screeplot of percent variance explained by first 20 PCs
+
+```{r, echo=FALSE}
+
+## Import and prep data for plotting
+
+#Import covariance matrix
+rd_mat <- as.matrix(read.table("https://raw.githubusercontent.com/meflacava/RelictDace/main/results/east_PCA.covMat"))
+
+#Import bamlist
+rd_meta <- read.table("https://raw.githubusercontent.com/meflacava/RelictDace/main/bamlists/bam.east.txt",header=F)
+
+#Import metadata to add to bamlist
+rd <- read.csv("https://raw.githubusercontent.com/meflacava/RelictDace/main/metadata/AllProjects_RD_Metadata.csv")
+
+#add metadata to rd_meta
+names(rd_meta) <- "SampleID"
+rd_meta$SampleID <- sub("_sorted_proper_rmdup.bam.*","",rd_meta$SampleID)
+rd_meta$SampleID <- sub(".*/home/mlacava/align/RAD_alignments/","",rd_meta$SampleID)
+#sum(rd_meta$SampleID %in% rd$SampleID) == nrow(rd_meta) #check all bam IDs are in metadata
+for (i in 1:nrow(rd_meta)){
+  rd_meta$Valley[i] <- rd$Valley[rd$SampleID==rd_meta$SampleID[i]]
+  rd_meta$Site[i] <- rd$Site[rd$SampleID==rd_meta$SampleID[i]]
+  rd_meta$SiteWaypoint[i] <- rd$SiteWaypoint[rd$SampleID==rd_meta$SampleID[i]]
+  rd_meta$LibPrepYear[i] <- rd$LibPrepYear[rd$SampleID==rd_meta$SampleID[i]]
+}
+#head(rd_meta)
+#order valleys and sites to group western valleys together
+#rd_meta$Valley <- factor(rd_meta$Valley,levels=c("Ruby Valley","Butte Valley","Goshute Valley","Spring Valley","Steptoe Valley"))
+#rd_meta$Site <- factor(rd_meta$Site,levels=c("RBFR","RBFL","RBRL","BTQP","BTOC","BTNS","BTST","GSTS","GSJS","STCO","STPR","STMR","STRT","STWA","SPSH","SPKR"))
+
+#prep matrix for plotting
+eig <- eigen(rd_mat, symm=T)
+eig$val <- eig$val/sum(eig$val)
+PC <- as.data.frame(eig$vectors)
+colnames(PC) <- gsub("V", "PC", colnames(PC))
+
+#adding metadata parameters
+PC$Valley <- factor(rd_meta$Valley)
+PC$Site <- factor(rd_meta$Site)
+PC$SiteWaypoint <- factor(rd_meta$SiteWaypoint)
+PC$LibPrepYear <- factor(rd_meta$LibPrepYear)
+
+#screeplot of % var explained by first 10 PC axes
+barplot(eig$val[1:10],ylab="% variance explained",names.arg=names(PC[1:10]))
+
+```
+
+```{r,echo=FALSE, eval=FALSE}
+# #Eastern valleys PCA (colored by valley) - PC1 x PC2 (by site is more helpful, so excluding)
+# 
+# #Goshute (red), Steptoe (yellow), Spring (green)
+# myColors <- c("#F49D94","#B9BE44","#6DCF9C")
+# names(myColors) <- unique(PC$Valley)
+# 
+# ggplot2::ggplot(PC, ggplot2::aes(x = PC1,y = PC2, color = Valley)) + 
+#   ggplot2::geom_point(cex = 4, alpha = 0.75) + 
+#   ggplot2::theme_classic() + 
+#   ggplot2::xlab(paste0("PC1, ", round(eig$val[1] * 100, 2), "% variance explained")) + 
+#   ggplot2::ylab(paste0("PC2, ", round(eig$val[2] * 100, 2), "% variance explained")) + 
+#   ggplot2::guides(color = ggplot2::guide_legend(title = "Valley")) +
+#   ggplot2::scale_color_manual(name="Valley",values=myColors)
+
+```
+
+### Eastern PCA - PC1 x PC2
+
+For the eastern valleys, PC1 separates Twin Springs (GSTS) from the rest of the sites, and PC2 clearly separates Spring valley sites from the other valleys. Along PC2 the majority of Steptoe valley sites cluster away from Goshute valley sites, except for the newly sample Cordano Ranch (STCO), which clusters with Johnson Springs (GSJS).
+
+```{r,echo=FALSE}
+ggplot2::ggplot(PC, ggplot2::aes(x = PC1,y = PC2, color = Site)) + 
+  ggplot2::geom_point(cex = 4, alpha = 0.75) + 
+  ggplot2::theme_classic() + 
+  ggplot2::xlab(paste0("PC1, ", round(eig$val[1] * 100, 2), "% variance explained")) + 
+  ggplot2::ylab(paste0("PC2, ", round(eig$val[2] * 100, 2), "% variance explained")) + 
+  ggplot2::guides(color = ggplot2::guide_legend(title = "Site"))
+```
+
+If we color more specific waypoints within sites, we can see that the two GSJS clusters split the Big Springs springhead sites (GSJS_BS, GSJS_BSN) from other sites in Johnson Springs.
+
+```{r,echo=FALSE}
+ggplot2::ggplot(PC, ggplot2::aes(x = PC1,y = PC2, color = SiteWaypoint)) + 
+  ggplot2::geom_point(cex = 4, alpha = 0.75) + 
+  ggplot2::theme_classic() + 
+  ggplot2::xlab(paste0("PC1, ", round(eig$val[1] * 100, 2), "% variance explained")) + 
+  ggplot2::ylab(paste0("PC2, ", round(eig$val[2] * 100, 2), "% variance explained")) + 
+  ggplot2::guides(color = ggplot2::guide_legend(title = "Waypoint"))
+```
+
+### Eastern PCA - PC2 x PC3
+
+PC3 separates Morrison Ranch (STMR) from other Steptoe valley sites
+
+```{r,echo=FALSE}
+ggplot2::ggplot(PC, ggplot2::aes(x = PC2,y = PC3, color = Site)) + 
+  ggplot2::geom_point(cex = 4, alpha = 0.75) + 
+  ggplot2::theme_classic() + 
+  ggplot2::xlab(paste0("PC2, ", round(eig$val[2] * 100, 2), "% variance explained")) + 
+  ggplot2::ylab(paste0("PC3, ", round(eig$val[3] * 100, 2), "% variance explained")) + 
+  ggplot2::guides(color = ggplot2::guide_legend(title = "Site"))
+```
+
+### Eastern PCA - PC2 x PC4
+
+PC4 separates Cordano Ranch (STCO) from other sites
+
+```{r,echo=FALSE}
+ggplot2::ggplot(PC, ggplot2::aes(x = PC2,y = PC4, color = Site)) + 
+  ggplot2::geom_point(cex = 4, alpha = 0.75) + 
+  ggplot2::theme_classic() + 
+  ggplot2::xlab(paste0("PC2, ", round(eig$val[2] * 100, 2), "% variance explained")) + 
+  ggplot2::ylab(paste0("PC4, ", round(eig$val[4] * 100, 2), "% variance explained")) + 
+  ggplot2::guides(color = ggplot2::guide_legend(title = "Site"))
+
+```

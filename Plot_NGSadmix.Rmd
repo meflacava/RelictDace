@@ -1,0 +1,272 @@
+---
+title: "Relict dace admixture results"
+author: "Melanie LaCava"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+#install.packages("BiocManager")
+#BiocManager::install("qvalue")
+#BiocManager::install("SNPRelate")
+#install.packages("GenomeAdapt")
+#library(GenomeAdapt)
+library(ggplot2)
+library(rgdal)
+library(RColorBrewer)
+#display.brewer.all()
+#barplot(1:12,col=brewer.pal(12,"Set3")) #example
+```
+
+## Run NGSadmix with desired range of k values
+
+After producing beagle.gz file with ANGSD (see Plot_PCAngsd.Rmd), run this script NGSadmix_10x.sh on FARM
+
+```{bash, eval=FALSE,echo=F}
+
+#!/bin/bash
+#SBATCH --mail-user=mlacava@ucdavis.edu
+#SBATCH --mail-type=END,FAIL
+#SBATCH --job-name=admix
+#SBATCH --time=3-00:00:00
+#SBATCH --partition=med
+#SBATCH --output=/home/mlacava/slurm_logs/admix-%A-%a.out
+#SBATCH --error=/home/mlacava/slurm_logs/admix-%A-%a.err
+#SBATCH --array=1-10
+
+#Submit job with: sbatch NGSadmix.sh [path/to/input/beagle] [path/to/desired/output]
+#EDIT the number of K values you want to test above in --array=1-n (e.g., 1-10)
+
+#Example:
+#sbatch NGSadmix.sh /home/mlacava/filtering/rwpopgen/rwpopgen_PCA.beagle.gz /home/mlacava/filtering/rwpopgen/admix/ngsadmix_rwpopgen
+
+#$1 #beagle file path/name (produced by PCAngsd)
+#$2 #desired output file path/name (will add K and run # to end)
+
+module load angsd
+module load ngsTools
+
+for i in {1..10}; #run multiple iterations of each K (to calc most likely K value)
+    do NGSadmix -likes $1 -K ${SLURM_ARRAY_TASK_ID} -minMaf 0.05 -o $2_k${SLURM_ARRAY_TASK_ID}_
+run$i -P 10;
+done
+
+```
+
+```{bash,eval=FALSE,echo=F}
+
+##Determine the most likely number of clusters
+
+#Print likelihood values to text file, in format accepted by CLUMPAK (first column = K, second column = likelihood) - i iterates over K, j iterates over runs of each K:
+for i in {1..10}; do for j in {1..10}; do printf '%d\t' "$i"; grep "best like=" ngsadmix_rwpopgen_k${i}_run${j}.log | sed -n 's/^.*= *\([^ ]*\) .*$/\1/p'; done; done > likelihoods_k1-10_rwpopgen.txt
+
+#Run CLUMPAK to determine most likely K (http://clumpak.tau.ac.il/bestK.html)
+
+```
+
+
+## Sampling sites
+
+```{r, echo=FALSE, results="hide", warning=FALSE}
+
+##Import valleys and sites shapefiles (download from GitHub to local maps folder)
+valleys <- readOGR(dsn="maps",layer="RD_valleys")
+sites <- readOGR(dsn="maps",layer="RD_sites")
+
+##Plot background color of valleys and site labels
+par(mar=c(1,1,1,1)) #default: par(mar=c(5.1,4.1,4.1,2.1))
+plot(valleys,col=valleys$color,border=F)
+plot(sites,add=T,pch=16,cex=0.7)
+text(sites,labels=sites$Site,cex=0.6,pos=4,offset=0.3)
+legend("bottomleft",legend=unique(valleys$valley),pch=22,col="black",pt.bg=unique(valleys$color),pt.cex=2)
+par(mar=c(5.1,4.1,4.1,2.1)) #reset par
+
+```
+
+## Range-wide admixture results
+
+K=2 clearly splits western valleys (Butte and Ruby) from eastern valleys, and then K=3 breaks Twin Springs (GSTS) off from other eastern sites into its own cluster. Evanno method in CLUMPAK suggests K=2 is the most likely number of clusters.
+
+```{r,echo=FALSE}
+
+#### Sample metadata ####
+#Import bamlist
+rd_meta <- read.table("https://raw.githubusercontent.com/meflacava/RelictDace/main/bamlists/bam.rwpopgen.txt",header=F)
+
+#Import metadata to add to bamlist
+rd <- read.csv("https://raw.githubusercontent.com/meflacava/RelictDace/main/metadata/AllProjects_RD_Metadata.csv")
+
+#add metadata to rd_meta
+names(rd_meta) <- "SampleID"
+rd_meta$SampleID <- sub("_sorted_proper_rmdup.bam.*","",rd_meta$SampleID)
+rd_meta$SampleID <- sub(".*/home/mlacava/align/RAD_alignments/","",rd_meta$SampleID)
+#sum(rd_meta$SampleID %in% rd$SampleID) == nrow(rd_meta) #check all bam IDs are in metadata
+for (i in 1:nrow(rd_meta)){
+  rd_meta$Valley[i] <- rd$Valley[rd$SampleID==rd_meta$SampleID[i]]
+  rd_meta$Site[i] <- rd$Site[rd$SampleID==rd_meta$SampleID[i]]
+  rd_meta$SiteWaypoint[i] <- rd$SiteWaypoint[rd$SampleID==rd_meta$SampleID[i]]
+}
+rd_meta$Valley <- factor(rd_meta$Valley)
+rd_meta$Site <- factor(rd_meta$Site)
+rd_meta$SiteWaypoint <- factor(rd_meta$SiteWaypoint,levels=c("RBFL","RBFR","RBRL_P226","RBRL_P246","BTOC","BTQP","BTST","BTNS","GSTS","GSJS_BS","GSJS_BSN","GSJS_CS02","GSJS_CS03","GSJS_CS04","GSJS_CS11","GSJS_CS16","GSJS_CS22A","GSJS_D01","GSJS_D09","GSJS_NS03","GSJS_NS05","GSJS_SS19","STCO","STPR_BT2","STPR_FT1","STMR","STRT","STWA","SPSH","SPKR"))
+
+```
+
+
+```{r, echo=FALSE,fig.dim=c(10,4)}
+
+#Loop through each k value to produce admixture plot
+for (i in 2:10){ #which k values do you want to show plots for?
+  q <- as.matrix(read.table(paste0("https://raw.githubusercontent.com/meflacava/RelictDace/main/results/admix/rw_allsamples_2017snps_k",i,"_run1.qopt")))
+  group <- rd_meta$SiteWaypoint
+  grp_name <- levels(factor(group))
+  idx <- list() #separate samples into groups
+  for (n in grp_name) {
+    x <- which(group == n)
+    x <- x[order(q[x, 1L], decreasing = TRUE)] #order q matrix by decreasing ancestry proportions
+    idx <- c(idx, list(x))
+  }
+  grp_len <- lengths(idx, use.names = FALSE)
+  xl <- c(0, cumsum(grp_len))
+  x <- xl[-1L] - 0.5 * grp_len
+  q <- q[unlist(idx),] #not sure what this does, but without it, site dividing lines don't work
+#  barplot(t(q),col=c(brewer.pal(9,"Set1"),"black"),space=0,border=NA,yaxt="n",
+#          main=paste0("k = ",i),xlab="",ylab="Ancestry proportion") #specific color palette
+  if (i==2){
+    barplot(t(q),col=hcl.colors(3,palette="Spectral")[c(1,3)],space=0,border=NA,yaxt="n",
+          main=paste0("k = ",i),xlab="",ylab="Ancestry proportion") #temp fix for bug in palette code that gives the same color twice when i=2
+  } else {
+    barplot(t(q),col=hcl.colors(i,palette="Spectral"),space=0,border=NA,yaxt="n",
+          main=paste0("k = ",i),xlab="",ylab="Ancestry proportion") #as many colors in spectrum as there are clusters
+  }
+  abline(v=xl,col="black")
+  axis(1,x,grp_name,las=3,cex.axis=0.75,tick=F,hadj=0.8)
+  axis(2,at=seq(0,1,0.25),las=1,cex.axis=0.74) 
+}
+
+```
+
+
+## Western valleys admixture results
+
+An admixture analysis for just the western valleys (Butte and Ruby) reveals that the first major split separates the newly sampled Stratton Ranch (BTST) and spring north of Stratton Ranch (BTNS) from the rest of the western valley sites. K=3-5 are a little weird, but then K=6 becomes distinct groups again, with a combined group for Stratton Ranch sites (BTST,BTST_NSR), a group for Odger's creek in Butte Valley (BTOC), a group for Quilici Pond in Butte Valley (BTQP), a combined group of Franklin River and Franklin Lake in Ruby Valley (RBFR,RBFL), and lastly a split in the Ruby Lake sites between Pond 226 and Pond 246 (same results as Finger et al. 2022). Mac's tree also shows Stratton Ranch sites as basal split from rest of western valley sites and otherwise our results agree, except his tree splits Franklin River from Franklin Lake, whereas that's less clear here (though maybe a further substructure analysis would reveal a clearer separation). The Evanno method (CLUMPAK) indicates K=6 is the most likely number of clusters.
+
+```{r,echo=FALSE}
+
+#### Sample metadata ####
+#Import bamlist
+rd_meta <- read.table("https://raw.githubusercontent.com/meflacava/RelictDace/main/bamlists/bam.west.txt",header=F)
+
+#Import metadata to add to bamlist
+rd <- read.csv("https://raw.githubusercontent.com/meflacava/RelictDace/main/metadata/AllProjects_RD_Metadata.csv")
+
+#add metadata to rd_meta
+names(rd_meta) <- "SampleID"
+rd_meta$SampleID <- sub("_sorted_proper_rmdup.bam.*","",rd_meta$SampleID)
+rd_meta$SampleID <- sub(".*/home/mlacava/align/RAD_alignments/","",rd_meta$SampleID)
+#sum(rd_meta$SampleID %in% rd$SampleID) == nrow(rd_meta) #check all bam IDs are in metadata
+for (i in 1:nrow(rd_meta)){
+  rd_meta$Valley[i] <- rd$Valley[rd$SampleID==rd_meta$SampleID[i]]
+  rd_meta$Site[i] <- rd$Site[rd$SampleID==rd_meta$SampleID[i]]
+  rd_meta$SiteWaypoint[i] <- rd$SiteWaypoint[rd$SampleID==rd_meta$SampleID[i]]
+}
+rd_meta$Valley <- factor(rd_meta$Valley)
+rd_meta$Site <- factor(rd_meta$Site)
+rd_meta$SiteWaypoint <- factor(rd_meta$SiteWaypoint,levels=c("RBFL","RBFR","RBRL_P226","RBRL_P246","BTOC","BTQP","BTST","BTST_NSR","GSTS","GSJS_BS","GSJS_BSN","GSJS_CS02","GSJS_CS03","GSJS_CS04","GSJS_CS11","GSJS_CS16","GSJS_CS22A","GSJS_D01","GSJS_D09","GSJS_NS03","GSJS_NS05","GSJS_SS19","STCO","STPR_BT2","STPR_FT1","STMR","STRT","STWA","SPSH","SPKR"))
+```
+
+
+```{r, echo=FALSE,fig.dim=c(10,4)}
+
+#Loop through each k value to produce admixture plot
+for (i in 2:10){ #which k values do you want to show plots for?
+  q <- as.matrix(read.table(paste0("https://raw.githubusercontent.com/meflacava/RelictDace/main/results/admix/west_allsamples_2017snps_k",i,"_run1.qopt")))
+  group <- rd_meta$SiteWaypoint
+  grp_name <- levels(factor(group))
+  idx <- list() #separate samples into groups
+  for (n in grp_name) {
+    x <- which(group == n)
+    x <- x[order(q[x, 1L], decreasing = TRUE)] #order q matrix by decreasing ancestry proportions
+    idx <- c(idx, list(x))
+  }
+  grp_len <- lengths(idx, use.names = FALSE)
+  xl <- c(0, cumsum(grp_len))
+  x <- xl[-1L] - 0.5 * grp_len
+  q <- q[unlist(idx),] #not sure what this does, but without it, site dividing lines don't work
+  if (i==2){
+    barplot(t(q),col=hcl.colors(3,palette="Spectral")[c(1,3)],space=0,border=NA,yaxt="n",
+          main=paste0("k = ",i),xlab="",ylab="Ancestry proportion") #temp fix for bug in palette code that gives the same color twice when i=2
+  } else {
+    barplot(t(q),col=hcl.colors(i,palette="Spectral"),space=0,border=NA,yaxt="n",
+          main=paste0("k = ",i),xlab="",ylab="Ancestry proportion") #as many colors in spectrum as there are clusters
+  }
+  abline(v=xl,col="black")
+  axis(1,x,grp_name,las=3,cex.axis=0.75,tick=F,hadj=0.8)
+  axis(2,at=seq(0,1,0.25),las=1,cex.axis=0.74) 
+}
+
+```
+
+
+## Eastern valleys admixture results
+
+In the eastern valleys, Twin Springs (GSTS) and Spring valley sites (SPSH,SPKR) are the first to separate out into two distinct clusters. When K=4, some Steptoe valley sites start to separate out, and other Steptoe sites (including newly sampled Cordano Ranch, STCO) are a mix between the Steptoe cluster and Goshute valley cluster. Once K=5+, STCO remains its own distinct cluster. Evanno method suggests K=7 is the most likely number of clusters, with the second most likely being K=16. K=7 mostly makes sense, but complex structure in Johnson Springs (GSJS) is causing weirdness with some Steptoe valley sites (STRT,STWA). When K=16, we see clear distinct groups among sites as expected, with a few GSJS sites being admixed among other GSJS sites, as expected.
+
+```{r,echo=FALSE}
+
+#### Sample metadata ####
+#Import bamlist
+rd_meta <- read.table("https://raw.githubusercontent.com/meflacava/RelictDace/main/bamlists/bam.east.txt",header=F)
+
+#Import metadata to add to bamlist
+rd <- read.csv("https://raw.githubusercontent.com/meflacava/RelictDace/main/metadata/AllProjects_RD_Metadata.csv")
+
+#add metadata to rd_meta
+names(rd_meta) <- "SampleID"
+rd_meta$SampleID <- sub("_sorted_proper_rmdup.bam.*","",rd_meta$SampleID)
+rd_meta$SampleID <- sub(".*/home/mlacava/align/RAD_alignments/","",rd_meta$SampleID)
+#sum(rd_meta$SampleID %in% rd$SampleID) == nrow(rd_meta) #check all bam IDs are in metadata
+for (i in 1:nrow(rd_meta)){
+  rd_meta$Valley[i] <- rd$Valley[rd$SampleID==rd_meta$SampleID[i]]
+  rd_meta$Site[i] <- rd$Site[rd$SampleID==rd_meta$SampleID[i]]
+  rd_meta$SiteWaypoint[i] <- rd$SiteWaypoint[rd$SampleID==rd_meta$SampleID[i]]
+}
+rd_meta$Valley <- factor(rd_meta$Valley)
+rd_meta$Site <- factor(rd_meta$Site)
+rd_meta$SiteWaypoint <- factor(rd_meta$SiteWaypoint,levels=c("RBFL","RBFR","RBRL_P226","RBRL_P246","BTOC","BTQP","BTST","BTNS","GSTS","GSJS_BS","GSJS_BSN","GSJS_CS02","GSJS_CS03","GSJS_CS04","GSJS_CS11","GSJS_CS16","GSJS_CS22A","GSJS_D01","GSJS_D09","GSJS_NS03","GSJS_NS05","GSJS_SS19","STCO","STPR_BT2","STPR_FT1","STMR","STRT","STWA","SPSH","SPKR"))
+
+```
+
+
+```{r, echo=FALSE,fig.dim=c(10,4)}
+
+#Loop through each k value to produce admixture plot
+for (i in 2:20){ #which k values do you want to show plots for?
+  q <- as.matrix(read.table(paste0("https://raw.githubusercontent.com/meflacava/RelictDace/main/results/admix/east_allsamples_2017snps_k",i,"_run1.qopt")))
+  group <- rd_meta$SiteWaypoint
+  grp_name <- levels(factor(group))
+  idx <- list() #separate samples into groups
+  for (n in grp_name) {
+    x <- which(group == n)
+    x <- x[order(q[x, 1L], decreasing = TRUE)] #order q matrix by decreasing ancestry proportions
+    idx <- c(idx, list(x))
+  }
+  grp_len <- lengths(idx, use.names = FALSE)
+  xl <- c(0, cumsum(grp_len))
+  x <- xl[-1L] - 0.5 * grp_len
+  q <- q[unlist(idx),] #not sure what this does, but without it, site dividing lines don't work
+  if (i==2){
+    barplot(t(q),col=hcl.colors(3,palette="Spectral")[c(1,3)],space=0,border=NA,yaxt="n",
+          main=paste0("k = ",i),xlab="",ylab="Ancestry proportion") #temp fix for bug in palette code that gives the same color twice when i=2
+  } else {
+    barplot(t(q),col=hcl.colors(i,palette="Spectral"),space=0,border=NA,yaxt="n",
+          main=paste0("k = ",i),xlab="",ylab="Ancestry proportion") #as many colors in spectrum as there are clusters
+  }
+  abline(v=xl,col="black")
+  axis(1,x,grp_name,las=3,cex.axis=0.75,tick=F,hadj=0.8)
+  axis(2,at=seq(0,1,0.25),las=1,cex.axis=0.74) 
+}
+
+```
+
