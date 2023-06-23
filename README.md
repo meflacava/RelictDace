@@ -20,6 +20,7 @@ Plot_Fst.Rmd = calculate pairwise Fst values for a given list of populations (fo
 
 RelictDace_ContractFigs.R = figures for contract report
 
+Plot_Phylo.Rmd = Steps and plotting commands for the SVDQuartets phylogeny. Input nexus file for SVDQuartets and output treefile in results/phylo          
 
 
 ## Folder contents:
