@@ -1,0 +1,144 @@
+---
+title: "Plot_Phylo"
+author: "Mac Campbell"
+date: "2022-06-23"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+```
+
+```{r}
+library(tidyverse)
+library(ggtree)
+library(ggpubr)
+library(ape)
+```     
+    
+## Notes
+
+Updating on June 23 2023 to RelictDace repository.       
+
+I included all samples previously sequenced by Alyssa (n=416; including 4 tui chub, 16 speckled dace (4 sequenced as outgroup, 12 misidentified as relict dace and now relabeled as SD), 50 new samples to put into context of range-wide genetics (20 Cordano Ranch, 30 Stratton Ranch), plus 30 samples I sequenced from Johnson Springs Wetland Complex that were geographically sampled close to sites that were sampled previously, to check for library effect. Of the 496 samples, I dropped 6 because they had <50K paired reads align to the reference genome.      
+
+## Set up samples
+
+```{r}
+meta<-read_csv("metadata/MetaData_RangeWidePhylo.csv")
+meta
+```
+
+Set up sample names
+ bcftools query -l rwphylo.vcf  > 490-samples.txt
+
+```{r}
+names<-read_tsv("results/phylo/490-samples.txt", col_names = c("Path"))
+names$SampleID<-gsub("_sorted_proper_rmdup.bam","",names$Path)
+names$SampleID<-gsub("/home/mlacava/align/RAD_alignments/","", names$SampleID)
+names<-relocate(names, SampleID, Path)
+meta<-left_join(names,meta)
+write_csv(meta, "metadata/meta490.csv")
+```
+
+```{r}
+write_tsv(meta %>% select(SampleID), col_names = FALSE, file="bamlists/490.names")
+```
+
+Get stats from files to filter. Melanie has already calculated.    
+
+```{r}
+stats<-read_delim("results/phylo/stats.dat", col_names = c("X1","Proper","Dedup")) %>% 
+                    separate(X1, sep="\t", into=c("SampleID","Raw")) 
+meta<-left_join(meta, stats)
+```    
+
+
+Get a reasonable number of samples from a reasonable area, dropping excess SD outgroups
+
+```{r}
+sub<- meta  %>% mutate(SpeciesValley=paste0(Species,Valley)) %>% filter(SpeciesValley !="Speckled DaceRuby Valley") %>%
+  group_by(Species,Valley, SampleSite) %>% top_n(10,Dedup) %>% ungroup()
+
+sub %>% group_by(Species,Valley, SampleSite) %>% 
+  summarise(Count=n(), Mean=mean(Dedup))
+write_csv(sub %>% group_by(Species,Valley, SampleSite) %>% 
+  summarise(Count=n(), Mean=mean(Dedup)), "results/phylo/phylo-table.csv")
+```
+```{r}
+write_tsv(sub %>% select(Path), col_names = FALSE, file="bamlists/203.bamlist")
+write_tsv(sub %>% select(SampleID), col_names = FALSE, file="bamlists/203.samples")
+```
+
+```{sh, eval=FALSE}
+srun -p high -t 18:00:00 --mem=16G --nodes=1 angsd -P 24 \
+-bam bamlists/203.bamlist \
+-out /home/maccamp/relictus/outputs/1200/plink \
+-anc /home/maccamp/genomes//GCA_022829085.1/GCA_022829085.1_ASM2282908v1_genomic.fna \
+-minInd 183 -minMaf 0.05  -minMapQ 10 -minQ 20 -GL 1 -doMajorMinor 1 -doMaf 1 -SNP_pval 1e-6 \
+-doGeno 4 -doPost 1 -postCutoff 0.95 -doPlink 2 >outputs/1200/std.out 2>outputs/1200/std.err &
+```
+
+Chrom1 CM040766.1 returns: 	-> Number of sites retained after filtering: 2516/1052 snps after pruning   
+
+     -r CM040766.1     
+
+Whole genome 48460 sites        
+
+Process locally
+
+## Process
+
+```{sh, eval=FALSE}
+plink --tped plink.tped --tfam plink.tfam  --out binary --recode --allow-extra-chr --noweb
+plink --ped binary.ped --map binary.map --recode vcf --allow-extra-chr -out recode
+bcftools +prune -l 0.25 -w 10000 recode.vcf  -Ov -o recode.prune.vcf
+bcftools reheader --samples ../../bamlists/203.samples -o recode.prune.reheadered.vcf recode.prune.vcf
+```
+
+This prune level might be adjusted.     
+
+Convert to phylip, then nexus. Create a missing data set    
+
+```{sh, eval=FALSE}
+source activate py2; ~/github/mccloud-rrt/vcf2phylip.py -i recode.prune.reheadered.vcf; conda deactivate;
+seqConverter.pl -drecode.prune.reheadered.min4.phy -on
+
+#Corrected for ascertainment bias
+conda activate py3; ~/github/mccloud-rrt/103-remove-invariant.py -p recode.prune.reheadered.min4.phy -o recode.prune.reheadered.min4.asc.phy; conda deactivate
+
+seqConverter.pl -drecode.prune.reheadered.min4.asc.phy -on
+
+#Now remove missing?? 
+ ~/github/relict-dace/201.1-removeMissing.pl recode.prune.reheadered.min4.asc.phy  > filtered.phy
+seqConverter.pl -dfiltered.phy -on
+```
+
+BSN_07,11,12 have a lot of missing data among others   
+
+15,8222 sites
+
+SVDQuartets combining filtered nexus file with grouped locations. See results/phylo/svdq.nex    
+
+```{r}
+write_tsv(sub %>% select(SampleID, SampleSite) %>% group_by(SampleSite) %>% summarize(Samples=paste0(SampleID, collapse="\t")), file="results/phylo/sample-meta.tsv")
+```
+        
+```{r}
+tips<-read_csv("results/phylo/phylo-tip-meta.csv")
+t<-read.nexus("results/phylo/svdq-bs.tre")
+```
+       
+```{r}
+u<-ggtree(t, branch.length = 'none') %<+% tips +
+  geom_tiplab(aes(label=ToLabel)) +
+  xlim(0,11)
+nodes<-u$data %>% filter(isTip==FALSE)
+nodes$label<-as.numeric(nodes$label)
+```
+      
+```{r}
+u + geom_point(data=nodes, aes(x=x, y=y, fill=label), pch=21, cex=3) + 
+  scale_fill_viridis_c(name="Bootstrap\nSupport",option="magma", direction=1)
+ggsave("results/phylo/relict-dace-phylo-06162023.pdf")
+```
